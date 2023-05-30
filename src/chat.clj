@@ -3,7 +3,7 @@
             [chat.email :as email]
             [chat.app :as app]
             [chat.home :as home]
-            [chat.worker :as worker]
+            [chat.subscriptions :as sub]
             [chat.schema :as schema]
             [clojure.test :as test]
             [clojure.tools.logging :as log]
@@ -16,8 +16,8 @@
   [app/plugin
    (biff/authentication-plugin {})
    home/plugin
-   schema/plugin
-   worker/plugin])
+   sub/plugin
+   schema/plugin])
 
 (def routes [["" {:middleware [biff/wrap-site-defaults]}
               (keep :routes plugins)]
@@ -53,7 +53,7 @@
    :biff/malli-opts #'malli-opts
    :biff.beholder/on-save #'on-save
    :biff.xtdb/tx-fns biff/tx-fns
-   :chat/chat-clients (atom #{})})
+   :com.eelchat/chat-clients (atom {})})
 
 (defonce system (atom {}))
 

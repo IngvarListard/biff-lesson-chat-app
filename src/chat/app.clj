@@ -1,153 +1,246 @@
 (ns chat.app
-  (:require [com.biffweb :as biff :refer [q]]
-            [chat.middleware :as mid]
+  (:require [chat.middleware :as mid]
             [chat.ui :as ui]
-            [chat.settings :as settings]
-            [rum.core :as rum]
-            [xtdb.api :as xt]
+            [clojure.string :as str]
             [ring.adapter.jetty9 :as jetty]
-            [cheshire.core :as cheshire]))
+            [rum.core :as rum]
+            [com.biffweb :as biff :refer [q]]
+            [chat.subscriptions :as sub]
+            [xtdb.api :as xt]))
 
-(defn set-foo [{:keys [session params] :as ctx}]
-  (biff/submit-tx ctx
-    [{:db/op :update
-      :db/doc-type :user
-      :xt/id (:uid session)
-      :user/foo (:foo params)}])
-  {:status 303
-   :headers {"location" "/app"}})
+(defn app [ctx]
+  (ui/app-page
+    ctx
+    [:p "Select a community, or create a new one."]))
 
-(defn bar-form [{:keys [value]}]
-  (biff/form
-   {:hx-post "/app/set-bar"
-    :hx-swap "outerHTML"}
-   [:label.block {:for "bar"} "Bar: "
-    [:span.font-mono (pr-str value)]]
-   [:.h-1]
-   [:.flex
-    [:input.w-full#bar {:type "text" :name "bar" :value value}]
-    [:.w-3]
-    [:button.btn {:type "submit"} "Update"]]
-   [:.h-1]
-   [:.text-sm.text-gray-600
-    "This demonstrates updating a value with HTMX."]))
-
-(defn set-bar [{:keys [session params] :as ctx}]
-  (biff/submit-tx ctx
-    [{:db/op :update
-      :db/doc-type :user
-      :xt/id (:uid session)
-      :user/bar (:bar params)}])
-  (biff/render (bar-form {:value (:bar params)})))
-
-(defn message [{:msg/keys [text sent-at]}]
-  [:.mt-3 {:_ "init send newMessage to #message-header"}
-   [:.text-gray-600 (biff/format-date sent-at "dd MMM yyyy HH:mm:ss")]
-   [:div text]])
-
-(defn notify-clients [{:keys [chat/chat-clients]} tx]
-  (doseq [[op & args] (::xt/tx-ops tx)
-          :when (= op ::xt/put)
-          :let [[doc] args]
-          :when (contains? doc :msg/text)
-          :let [html (rum/render-static-markup
-                      [:div#messages {:hx-swap-oob "afterbegin"}
-                       (message doc)])]
-          ws @chat-clients]
-    (jetty/send! ws html)))
-
-(defn send-message [{:keys [session] :as ctx} {:keys [text]}]
-  (let [{:keys [text]} (cheshire/parse-string text true)]
+(defn new-community [{:keys [session] :as ctx}]
+  (let [comm-id (random-uuid)]
     (biff/submit-tx ctx
-      [{:db/doc-type :msg
-        :msg/user (:uid session)
-        :msg/text text
-        :msg/sent-at :db/now}])))
+                    [{:db/doc-type :community
+                      :xt/id       comm-id
+                      :comm/title  (str "Community #" (rand-int 1000))}
+                     {:db/doc-type :membership
+                      :mem/user    (:uid session)
+                      :mem/comm    comm-id
+                      :mem/roles   #{:admin}}])
+    {:status  303
+     :headers {"Location" (str "/community/" comm-id)}}))
 
-(defn chat [{:keys [biff/db]}]
-  (let [messages (q db
-                    '{:find (pull msg [*])
-                      :in [t0]
-                      :where [[msg :msg/sent-at t]
-                              [(<= t0 t)]]}
-                    (biff/add-seconds (java.util.Date.) (* -60 10)))]
-    [:div {:hx-ext "ws" :ws-connect "/app/chat"}
-     [:form.mb-0 {:ws-send true
-                  :_ "on submit set value of #message to ''"}
-      [:label.block {:for "message"} "Write a message"]
-      [:.h-1]
-      [:textarea.w-full#message {:name "text"}]
-      [:.h-1]
-      [:.text-sm.text-gray-600
-       "Sign in with an incognito window to have a conversation with yourself."]
-      [:.h-2]
-      [:div [:button.btn {:type "submit"} "Send message"]]]
-     [:.h-6]
-     [:div#message-header
-      {:_ "on newMessage put 'Messages sent in the past 10 minutes:' into me"}
-      (if (empty? messages)
-        "No messages yet."
-        "Messages sent in the past 10 minutes:")]
-     [:div#messages
-      (map message (sort-by :msg/sent-at #(compare %2 %1) messages))]]))
+(defn new-channel [{:keys [community roles] :as ctx}]
+  (if (and community (contains? roles :admin))
+    (let [chan-id (random-uuid)]
+      (biff/submit-tx ctx
+                      [{:db/doc-type :channel
+                        :xt/id       chan-id
+                        :chan/title  (str "Channel #" (rand-int 1000))
+                        :chan/comm   (:xt/id community)}])
+      {:status  303
+       :headers {"Location" (str "/community/" (:xt/id community) "/channel/" chan-id)}})
+    {:status 403
+     :body   "Forbidden."}))
 
-(defn app [{:keys [session biff/db] :as ctx}]
-  (let [{:user/keys [email foo bar]} (xt/entity db (:uid session))]
-    (ui/page
-     {}
-     [:div "Signed in as " email ". "
+(defn delete-channel [{:keys [channel roles] :as ctx}]
+  (when (contains? roles :admin)
+    (biff/submit-tx ctx
+                    [{:db/op :delete
+                      :xt/id (:xt/id channel)}]))
+  [:<>])
+
+(defn community [{:keys [biff/db user community] :as ctx}]
+  (let [member (some (fn [mem]
+                       (= (:xt/id community) (get-in mem [:mem/comm :xt/id])))
+                     (:user/mems user))]
+    (ui/app-page
+      ctx
+      (if member
+        [:<>
+         [:.border.border-neutral-600.p-3.bg-white.grow
+          "Messages window"]
+         [:.h-3]
+         [:.border.border-neutral-600.p-3.h-28.bg-white
+          "Compose window"]]
+        [:<>
+         [:.grow]
+         [:h1.text-3xl.text-center (:comm/title community)]
+         [:.h-6]
+         (biff/form
+           {:action (str "/community/" (:xt/id community) "/join")
+            :class  "flex justify-center"}
+           [:button.btn {:type "submit"} "Join this community"])
+         [:div {:class "grow-[1.75]"}]]))))
+
+(defn message-view [{:msg/keys [mem text created-at]}]
+  (let [username (if (= :system mem)
+                   "🎅🏻 System 🎅🏻"
+                   (str "User " (subs (str mem) 0 4)))]
+    [:div
+     [:.text-sm
+      [:span.font-bold username]
+      [:span.w-2.inline-block]
+      [:span.text-gray-600 (biff/format-date created-at "d MMM h:mm aa")]]
+     [:p.whitespace-pre-wrap.mb-6 text]]))
+
+(defn command-tx [{:keys [biff/db channel roles params]}]
+  (let [subscribe-url (second (re-find #"^/subscribe ([^\s]+)" (:text params)))
+        unsubscribe-url (second (re-find #"^/unsubscribe ([^\s]+)" (:text params)))
+        list-command (= (str/trimr (:text params)) "/list")
+        message (fn [text]
+                  {:db/doc-type    :message
+                   :msg/mem        :system
+                   :msg/channel    (:xt/id channel)
+                   :msg/text       text
+                   ;; Make sure this message comes after the user's message.
+                   :msg/created-at (biff/add-seconds (java.util.Date.) 1)})]
+    (cond
+      (not (contains? roles :admin))
+      nil
+      subscribe-url
+      [{:db/doc-type  :subscription
+        :db.op/upsert {:sub/url  subscribe-url
+                       :sub/chan (:xt/id channel)}}
+       (message (str "Subscribed to " subscribe-url))]
+      unsubscribe-url
+      [{:db/op :delete
+        :xt/id (biff/lookup-id db :sub/chan (:xt/id channel) :sub/url unsubscribe-url)}
+       (message (str "Unsubscribed from " unsubscribe-url))]
+      list-command
+      [(message (apply
+                  str
+                  "Subscriptions:"
+                  (for [url (->> (q db
+                                    '{:find  (pull sub [:sub/url])
+                                      :in    [channel]
+                                      :where [[sub :sub/chan channel]]}
+                                    (:xt/id channel))
+                                 (map :sub/url)
+                                 sort)]
+                    (str "\n - " url))))])))
+
+(defn new-message [{:keys [channel mem params] :as ctx}]
+  (let [msg {:xt/id          (random-uuid)
+             :msg/mem        (:xt/id mem)
+             :msg/channel    (:xt/id channel)
+             :msg/created-at (java.util.Date.)
+             :msg/text       (:text params)}]
+    (biff/submit-tx (assoc ctx :biff.xtdb/retry false)
+                    (concat [(assoc msg :db/doc-type :message)]
+                            (command-tx ctx)))
+    (message-view msg)))
+
+(defn channel-page [{:keys [biff/db community channel] :as ctx}]
+  (let [msgs (q db
+                '{:find  (pull msg [*])
+                  :in    [channel]
+                  :where [[msg :msg/channel channel]]}
+                (:xt/id channel))
+        href (str "/community/" (:xt/id community)
+                  "/channel/" (:xt/id channel))]
+    (ui/app-page
+      ctx
+      [:.border.border-neutral-600.p-3.bg-white.grow.flex-1.overflow-y-auto#messages
+       {:hx-ext     "ws"
+        :ws-connect (str href "/connect")
+        :_          "on load or newMessage set my scrollTop to my scrollHeight"}
+       (map message-view (sort-by :msg/created-at msgs))]
+      [:.h-3]
       (biff/form
-       {:action "/auth/signout"
-        :class "inline"}
-       [:button.text-blue-500.hover:text-blue-800 {:type "submit"}
-        "Sign out"])
-      "."]
-     [:.h-6]
-     (biff/form
-      {:action "/app/set-foo"}
-      [:label.block {:for "foo"} "Foo: "
-       [:span.font-mono (pr-str foo)]]
-      [:.h-1]
-      [:.flex
-       [:input.w-full#foo {:type "text" :name "foo" :value foo}]
-       [:.w-3]
-       [:button.btn {:type "submit"} "Update"]]
-      [:.h-1]
-      [:.text-sm.text-gray-600
-       "This demonstrates updating a value with a plain old form."])
-     [:.h-6]
-     (bar-form {:value bar})
-     [:.h-6]
-     (chat ctx))))
+        {:hx-post   href
+         :hx-target "#messages"
+         :hx-swap   "beforeend"
+         :_         (str "on htmx:afterRequest"
+                         " set <textarea/>'s value to ''"
+                         " then send newMessage to #messages")
+         :class     "flex"}
+        [:textarea.w-full#text {:name "text"}]
+        [:.w-2]
+        [:button.btn {:type "submit"} "Send"]))))
 
-(defn ws-handler [{:keys [chat/chat-clients] :as ctx}]
-  {:status 101
-   :headers {"upgrade" "websocket"
+(defn connect [{:keys            [com.eelchat/chat-clients]
+                {chan-id :xt/id} :channel
+                {mem-id :xt/id}  :mem
+                :as              ctx}]
+  {:status  101
+   :headers {"upgrade"    "websocket"
              "connection" "upgrade"}
-   :ws {:on-connect (fn [ws]
-                      (swap! chat-clients conj ws))
-        :on-text (fn [ws text-message]
-                   (send-message ctx {:ws ws :text text-message}))
-        :on-close (fn [ws status-code reason]
-                    (swap! chat-clients disj ws))}})
+   :ws      {:on-connect (fn [ws]
+                           (prn :connect (swap! chat-clients assoc-in [chan-id mem-id] ws)))
+             :on-close   (fn [ws status-code reason]
+                           (prn :disconnect
+                                (swap! chat-clients
+                                       (fn [chat-clients]
+                                         (let [chat-clients (update chat-clients chan-id dissoc mem-id)]
+                                           (if (empty? (get chat-clients chan-id))
+                                             (dissoc chat-clients chan-id)
+                                             chat-clients))))))}})
 
-(def about-page
-  (ui/page
-   {:base/title (str "About " settings/app-name)}
-   [:p "This app was made with "
-    [:a.link {:href "https://biffweb.com"} "Biff"] "."]))
+(defn on-new-message [{:keys [biff.xtdb/node com.eelchat/chat-clients]} tx]
+  (let [db-before (xt/db node {::xt/tx-id (dec (::xt/tx-id tx))})]
+    (doseq [[op & args] (::xt/tx-ops tx)
+            :when (= op ::xt/put)
+            :let [[doc] args]
+            :when (and (contains? doc :msg/text)
+                       (nil? (xt/entity db-before (:xt/id doc))))
+            :let [html (rum/render-static-markup
+                         [:div#messages {:hx-swap-oob "beforeend"}
+                          (message-view doc)
+                          [:div {:_ "init send newMessage to #messages then remove me"}]])]
+            [mem-id client] (get @chat-clients (:msg/channel doc))
+            :when (not= mem-id (:msg/mem doc))]
+      (jetty/send! client html))))
 
-(defn echo [{:keys [params]}]
-  {:status 200
-   :headers {"content-type" "application/json"}
-   :body params})
+(defn on-new-subscription [{:keys [biff.xtdb/node] :as ctx} tx]
+  (let [db-before (xt/db node {::xt/tx-id (dec (::xt/tx-id tx))})]
+    (doseq [[op & args] (::xt/tx-ops tx)
+            :when (= op ::xt/put)
+            :let [[doc] args]
+            :when (and (contains? doc :sub/url)
+                       (nil? (xt/entity db-before (:xt/id doc))))]
+      (biff/submit-job ctx :fetch-rss (assoc doc :biff/priority 0)))))
+
+(defn on-tx [ctx tx]
+  (on-new-message ctx tx)
+  (on-new-subscription ctx tx))
+
+(defn wrap-community [handler]
+  (fn [{:keys [biff/db user path-params] :as ctx}]
+    (if-some [community (xt/entity db (parse-uuid (:id path-params)))]
+      (let [mem (->> (:user/mems user)
+                     (filter (fn [mem]
+                               (= (:xt/id community) (get-in mem [:mem/comm :xt/id]))))
+                     first)
+            roles (:mem/roles mem)]
+        (handler (assoc ctx :community community :roles roles :mem mem)))
+      {:status  303
+       :headers {"location" "/app"}})))
+
+(defn join-community [{:keys [user community] :as ctx}]
+  (biff/submit-tx ctx
+                  [{:db/doc-type  :membership
+                    :db.op/upsert {:mem/user (:xt/id user)
+                                   :mem/comm (:xt/id community)}
+                    :mem/roles    [:db/default #{}]}])
+  {:status  303
+   :headers {"Location" (str "/community/" (:xt/id community))}})
+
+(defn wrap-channel [handler]
+  (fn [{:keys [biff/db user mem community path-params] :as ctx}]
+    (let [channel (xt/entity db (parse-uuid (:chan-id path-params)))]
+      (if (and (= (:chan/comm channel) (:xt/id community)) mem)
+        (handler (assoc ctx :channel channel))
+        {:status  303
+         :headers {"Location" (str "/community/" (:xt/id community))}}))))
 
 (def plugin
-  {:static {"/about/" about-page}
-   :routes ["/app" {:middleware [mid/wrap-signed-in]}
-            ["" {:get app}]
-            ["/set-foo" {:post set-foo}]
-            ["/set-bar" {:post set-bar}]
-            ["/chat" {:get ws-handler}]]
-   :api-routes [["/api/echo" {:post echo}]]
-   :on-tx notify-clients})
+  {:routes ["" {:middleware [mid/wrap-signed-in]}
+            ["/app" {:get app}]
+            ["/community" {:post new-community}]
+            ["/community/:id" {:middleware [wrap-community]}
+             ["" {:get community}]
+             ["/join" {:post join-community}]
+             ["/channel" {:post new-channel}]
+             ["/channel/:chan-id" {:middleware [wrap-channel]}
+              ["" {:get    channel-page
+                   :post   new-message
+                   :delete delete-channel}]
+              ["/connect" {:get connect}]]]]
+   :on-tx on-tx})
